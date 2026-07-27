@@ -37,6 +37,9 @@ class DefaultSettings(BaseSettings):
 
     # 3rd party
     fireworks_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    openrouter_embed_model: str = "openai/text-embedding-3-small"
+    openrouter_rerank_model: str = "cohere/rerank-v3.5"
 
 
 class Settings(DefaultSettings):

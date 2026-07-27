@@ -1,9 +1,10 @@
-"""Compare three retrieval modes on a BEIR IR benchmark, side by side.
+"""Compare four retrieval modes on a BEIR IR benchmark, side by side.
 
 Modes evaluated:
   1. BM25-only      -> sherloque.retrieve.BM25Retriever (lexical, SQL BM25)
   2. Vector-only    -> sherloque.retrieve.VectorRetriever (dense, pgvector cosine)
   3. RRF fusion     -> reciprocal_rank_fusion([bm25, vector]) (hybrid)
+  4. RRF + reranker -> CrossEncoderReRanker over the fused top-k candidates
 
 Each query is run through the REAL production retrievers (not a self-contained
 copy of the SQL) so the eval exercises the same code path the app uses. Results
@@ -54,6 +55,8 @@ Examples:
 import argparse
 import asyncio
 import logging
+import math
+import statistics
 import subprocess
 import sys
 import time
@@ -74,8 +77,14 @@ if str(SRC_DIR) not in sys.path:
 # embedding client is configured regardless of import order.
 load_dotenv(SRC_DIR / ".env")
 
-from sherloque.config import get_async_engine  # noqa: E402
+from sherloque.config import get_async_engine, get_settings  # noqa: E402
 from sherloque.crawler.base import CrawlerBase  # noqa: E402
+from sherloque.model_providers import (  # noqa: E402
+    BaseModelProvider,
+    FireworksModelProvider,
+    OpenRouterModelProvider,
+)
+from sherloque.rank import CrossEncoderReRanker  # noqa: E402
 from sherloque.retrieve import (  # noqa: E402
     BM25Retriever,
     BM25RetrieverConfig,
@@ -91,7 +100,6 @@ DEFAULT_K1 = 1.5
 DEFAULT_B = 0.75
 DEFAULT_TOP_K = 100  # candidate pool depth fed to each retriever and to RRF
 DEFAULT_RRF_K = 60
-EMBEDDING_MODEL = "accounts/fireworks/models/qwen3-embedding-8b"
 METRICS = ["ndcg@10", "recall@100", "map", "mrr@10", "precision@10"]
 
 BACKFILL_SCRIPT = Path(__file__).resolve().parent / "backfill_embeddings.py"
@@ -196,10 +204,12 @@ async def load_id_to_url(engine: AsyncEngine) -> dict[int, str]:
 
 
 # --------------------------------------------------------------------------- #
-# Retrieval: run all three modes per query
+# Retrieval: run all four modes per query
 # --------------------------------------------------------------------------- #
 async def run_all_modes(
     engine: AsyncEngine,
+    embedding_model: BaseModelProvider,
+    rerank_model: BaseModelProvider,
     dataset_name: str,
     id_to_url: dict[int, str],
     k1: float,
@@ -207,9 +217,11 @@ async def run_all_modes(
     top_k: int,
     rrf_k: int,
     concurrency: int,
-) -> dict[str, dict[str, dict[str, float]]]:
-    """Returns {"bm25": run, "vector": run, "rrf": run} where each run is the
-    ranx-style {query_id: {doc_url: score}}."""
+) -> tuple[
+    dict[str, dict[str, dict[str, float]]],
+    dict[str, list[float]],
+]:
+    """Return ranx runs and per-query end-to-end latency for each mode."""
     dataset = ir_datasets.load(dataset_name)
     queries = []
     for query in dataset.queries_iter():
@@ -219,13 +231,24 @@ async def run_all_modes(
 
     bm25 = BM25Retriever(engine, BM25RetrieverConfig(k1=k1, b=b, top_k=top_k))
     vector = VectorRetriever(
-        engine, VectorRetrieverConfig(embedding_model=EMBEDDING_MODEL, top_k=top_k)
+        engine,
+        VectorRetrieverConfig(top_k=top_k),
+        embedding_model,
     )
+    reranker = CrossEncoderReRanker(engine, rerank_model)
 
     runs: dict[str, dict[str, dict[str, float]]] = {
         "bm25": {},
         "vector": {},
         "rrf": {},
+        "reranked": {},
+    }
+    latencies: dict[str, list[float]] = {
+        "bm25": [],
+        "vector": [],
+        "rrf": [],
+        "reranked": [],
+        "reranker_stage": [],
     }
     sem = asyncio.Semaphore(concurrency)
 
@@ -243,20 +266,49 @@ async def run_all_modes(
         async with sem:
             # Both get the raw query; VectorRetriever applies the qwen3
             # `Instruct: ...\nQuery: ...` wrapper internally.
+            started = time.perf_counter()
             bm25_results = await bm25.retrieve(query=qtext, top_k=top_k)
-            vector_results = await vector.retrieve(query=qtext, top_k=top_k)
+            bm25_elapsed = time.perf_counter() - started
 
-        # RRF only uses rank order, so feed the raw retriever lists (both best-
-        # first by score desc) straight in.
-        fused = reciprocal_rank_fusion([bm25_results, vector_results], k=rrf_k)
+            started = time.perf_counter()
+            vector_results = await vector.retrieve(query=qtext, top_k=top_k)
+            vector_elapsed = time.perf_counter() - started
+
+            # RRF only uses rank order, so feed the raw retriever lists (both
+            # best-first by score desc) straight in.
+            started = time.perf_counter()
+            fused = reciprocal_rank_fusion(
+                [bm25_results, vector_results],
+                k=rrf_k,
+            )
+            fusion_elapsed = time.perf_counter() - started
+
+            # The configured top_k is the candidate-pool depth for the
+            # cross-encoder as well as for the first-stage retrievers.
+            started = time.perf_counter()
+            reranked = await reranker.rank(
+                query=qtext,
+                candidates=fused[:top_k],
+                top_k=top_k,
+            )
+            reranker_elapsed = time.perf_counter() - started
 
         runs["bm25"][qid] = to_url_run(bm25_results)
         # Vector score is already cosine similarity (higher better); use as-is.
         runs["vector"][qid] = to_url_run(vector_results)
         runs["rrf"][qid] = to_url_run(fused)
+        runs["reranked"][qid] = to_url_run(reranked)
+
+        latencies["bm25"].append(bm25_elapsed)
+        latencies["vector"].append(vector_elapsed)
+        latencies["rrf"].append(bm25_elapsed + vector_elapsed + fusion_elapsed)
+        latencies["reranked"].append(
+            bm25_elapsed + vector_elapsed + fusion_elapsed + reranker_elapsed
+        )
+        latencies["reranker_stage"].append(reranker_elapsed)
 
     await asyncio.gather(*(score_one(qid, qtext) for qid, qtext in queries))
-    return runs
+    return runs, latencies
 
 
 def load_qrels(dataset_name: str) -> dict[str, dict[str, int]]:
@@ -295,14 +347,26 @@ def score_run(
 def print_comparison(
     args: argparse.Namespace,
     results: dict[str, tuple[dict[str, float], int]],
+    latencies: dict[str, list[float]],
+    embedding_model: FireworksModelProvider,
+    rerank_model: BaseModelProvider,
 ) -> None:
-    order = ["bm25", "vector", "rrf"]
-    labels = {"bm25": "BM25", "vector": "Vector", "rrf": "RRF"}
+    order = ["bm25", "vector", "rrf", "reranked"]
+    labels = {
+        "bm25": "BM25",
+        "vector": "Vector",
+        "rrf": "RRF",
+        "reranked": "RRF+CE",
+    }
 
     print()
     print(f"dataset:        {args.dataset}")
     print(f"BM25 params:    k1={args.k1} b={args.b}")
-    print(f"vector model:   {EMBEDDING_MODEL} (qwen3 Instruct/Query wrapper)")
+    print(
+        f"vector model:   {embedding_model.embed_model} "
+        "(qwen3 Instruct/Query wrapper)"
+    )
+    print(f"rerank model:   {rerank_model.rerank_model}")
     print(f"pool top_k:     {args.top_k}   RRF k: {args.rrf_k}")
     print(
         "scored queries: "
@@ -319,6 +383,23 @@ def print_comparison(
         best = max(order, key=lambda m: results[m][0][metric])
         print(f"{metric:>14} | {cells}   <- {labels[best]}")
     print("=" * 58)
+    print("latency per query (end-to-end for each mode)")
+    for mode in order:
+        values_ms = [value * 1000 for value in latencies[mode]]
+        if not values_ms:
+            continue
+        p95_index = max(0, math.ceil(0.95 * len(values_ms)) - 1)
+        p95 = sorted(values_ms)[p95_index]
+        print(
+            f"{labels[mode]:>14}: "
+            f"mean={statistics.fmean(values_ms):.1f}ms  p95={p95:.1f}ms"
+        )
+    reranker_ms = [value * 1000 for value in latencies["reranker_stage"]]
+    if reranker_ms:
+        print(
+            f"{'CE stage only':>14}: "
+            f"mean={statistics.fmean(reranker_ms):.1f}ms"
+        )
 
 
 async def async_main(args: argparse.Namespace) -> None:
@@ -358,30 +439,60 @@ async def async_main(args: argparse.Namespace) -> None:
         id_to_url = await load_id_to_url(engine)
         LOG.info("loaded _id->url map for %d documents", len(id_to_url))
 
-        LOG.info("running BM25 + vector + RRF over %s", args.dataset)
-        runs = await run_all_modes(
-            engine,
-            args.dataset,
-            id_to_url,
-            args.k1,
-            args.b,
-            args.top_k,
-            args.rrf_k,
-            args.concurrency,
+        LOG.info("running BM25 + vector + RRF + reranker over %s", args.dataset)
+        settings = get_settings()
+        embedding_model = FireworksModelProvider(
+            api_key=settings.fireworks_api_key
         )
+        if args.reranker_provider == "openrouter":
+            rerank_model: BaseModelProvider = OpenRouterModelProvider(
+                api_key=settings.openrouter_api_key,
+                embed_model=settings.openrouter_embed_model,
+                rerank_model=(
+                    args.openrouter_rerank_model
+                    or settings.openrouter_rerank_model
+                ),
+            )
+        else:
+            rerank_model = embedding_model
+        try:
+            runs, latencies = await run_all_modes(
+                engine,
+                embedding_model,
+                rerank_model,
+                args.dataset,
+                id_to_url,
+                args.k1,
+                args.b,
+                args.top_k,
+                args.rrf_k,
+                args.concurrency,
+            )
+        finally:
+            if rerank_model is not embedding_model:
+                await rerank_model.aclose()
+            await embedding_model.aclose()
 
         qrels_dict = load_qrels(args.dataset)
         LOG.info("loaded qrels for %d queries", len(qrels_dict))
 
         results = {mode: score_run(run, qrels_dict) for mode, run in runs.items()}
-        print_comparison(args, results)
+        print_comparison(
+            args,
+            results,
+            latencies,
+            embedding_model,
+            rerank_model,
+        )
     finally:
         await engine.dispose()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare BM25 / vector / RRF retrieval on a BEIR dataset.",
+        description=(
+            "Compare BM25 / vector / RRF / RRF+reranker on a BEIR dataset."
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -436,6 +547,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="queries to run in parallel (each does 1 embedding API call)",
+    )
+    parser.add_argument(
+        "--reranker-provider",
+        choices=("fireworks", "openrouter"),
+        default="fireworks",
+        help="provider used only for the cross-encoder rerank stage",
+    )
+    parser.add_argument(
+        "--openrouter-rerank-model",
+        default=None,
+        help=(
+            "OpenRouter rerank model override "
+            "(default: OPENROUTER_RERANK_MODEL or cohere/rerank-v3.5)"
+        ),
     )
     return parser.parse_args()
 
