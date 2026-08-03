@@ -54,6 +54,7 @@ Examples:
 
 import argparse
 import asyncio
+import json
 import logging
 import math
 import statistics
@@ -63,6 +64,7 @@ import time
 from pathlib import Path
 
 import ir_datasets
+import httpx
 from dotenv import load_dotenv
 from ranx import Qrels, Run, evaluate
 from sqlalchemy import text
@@ -95,6 +97,8 @@ from sherloque.retrieve import (  # noqa: E402
 
 LOG = logging.getLogger("eval_retrieval")
 
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 529}
+
 DEFAULT_DATASET = "beir/scifact/test"
 DEFAULT_K1 = 1.5
 DEFAULT_B = 0.75
@@ -103,6 +107,129 @@ DEFAULT_RRF_K = 60
 METRICS = ["ndcg@10", "recall@100", "map", "mrr@10", "precision@10"]
 
 BACKFILL_SCRIPT = Path(__file__).resolve().parent / "backfill_embeddings.py"
+
+
+def provider_name(provider: BaseModelProvider) -> str:
+    return type(provider).__name__
+
+
+def model_name(provider: BaseModelProvider, attribute: str) -> str | None:
+    value = getattr(provider, attribute, None)
+    return str(value) if value is not None else None
+
+
+def checkpoint_metadata(
+    *,
+    dataset_name: str,
+    k1: float,
+    b: float,
+    top_k: int,
+    rrf_k: int,
+    embedding_model: BaseModelProvider,
+    rerank_model: BaseModelProvider,
+) -> dict:
+    return {
+        "dataset": dataset_name,
+        "k1": k1,
+        "b": b,
+        "top_k": top_k,
+        "rrf_k": rrf_k,
+        "embedding_provider": provider_name(embedding_model),
+        "embedding_model": model_name(embedding_model, "embed_model"),
+        "rerank_provider": provider_name(rerank_model),
+        "rerank_model": model_name(rerank_model, "rerank_model"),
+    }
+
+
+def load_evaluation_checkpoint(path: Path, expected_metadata: dict) -> dict:
+    checkpoint = json.loads(path.read_text())
+    if checkpoint.get("metadata") != expected_metadata:
+        raise ValueError(
+            "evaluation checkpoint does not match the current configuration"
+        )
+    return checkpoint
+
+
+def save_evaluation_checkpoint(
+    path: Path,
+    *,
+    metadata: dict,
+    runs: dict,
+    latencies: dict,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "metadata": metadata,
+                "runs": runs,
+                "latencies": latencies,
+            }
+        )
+    )
+    temporary.replace(path)
+
+
+def is_transient_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in TRANSIENT_HTTP_STATUSES
+    # OpenRouter can return HTTP 200 with an error envelope. The provider
+    # rejects that body as invalid, so retry the request at the consumer edge.
+    return isinstance(exc, ValueError) and str(exc) in {
+        "Invalid OpenRouter embeddings response",
+        "Invalid OpenRouter rerank response",
+    }
+
+
+async def with_provider_backoff(operation, *, sleep=asyncio.sleep):
+    delay = 2.0
+    for attempt in range(8):
+        try:
+            return await operation()
+        except (ValueError, httpx.HTTPStatusError) as exc:
+            if not is_transient_provider_error(exc) or attempt == 7:
+                raise
+            LOG.warning("provider request failed; backing off %.1fs", delay)
+            await sleep(delay)
+            delay = min(delay * 2, 60.0)
+    raise RuntimeError("unreachable")
+
+
+def create_models(args, settings) -> tuple[BaseModelProvider, BaseModelProvider]:
+    if args.embedding_provider == "openrouter":
+        embedding_model: BaseModelProvider = OpenRouterModelProvider(
+            api_key=settings.openrouter_api_key,
+            embed_model=(
+                args.openrouter_embed_model or settings.openrouter_embed_model
+            ),
+            rerank_model=(
+                args.openrouter_rerank_model or settings.openrouter_rerank_model
+            ),
+        )
+    else:
+        embedding_model = FireworksModelProvider(
+            api_key=settings.fireworks_api_key
+        )
+
+    if args.reranker_provider == "openrouter":
+        if isinstance(embedding_model, OpenRouterModelProvider):
+            rerank_model = embedding_model
+        else:
+            rerank_model = OpenRouterModelProvider(
+                api_key=settings.openrouter_api_key,
+                embed_model=(
+                    args.openrouter_embed_model
+                    or settings.openrouter_embed_model
+                ),
+                rerank_model=(
+                    args.openrouter_rerank_model
+                    or settings.openrouter_rerank_model
+                ),
+            )
+    else:
+        rerank_model = embedding_model
+    return embedding_model, rerank_model
 
 
 class BEIRIndexer(CrawlerBase):
@@ -217,11 +344,15 @@ async def run_all_modes(
     top_k: int,
     rrf_k: int,
     concurrency: int,
+    checkpoint_path: Path | None = None,
+    request_delay: float = 0.0,
 ) -> tuple[
     dict[str, dict[str, dict[str, float]]],
     dict[str, list[float]],
 ]:
     """Return ranx runs and per-query end-to-end latency for each mode."""
+    if checkpoint_path and concurrency != 1:
+        raise ValueError("checkpointing requires concurrency=1")
     dataset = ir_datasets.load(dataset_name)
     queries = []
     for query in dataset.queries_iter():
@@ -250,6 +381,20 @@ async def run_all_modes(
         "reranked": [],
         "reranker_stage": [],
     }
+    metadata = checkpoint_metadata(
+        dataset_name=dataset_name,
+        k1=k1,
+        b=b,
+        top_k=top_k,
+        rrf_k=rrf_k,
+        embedding_model=embedding_model,
+        rerank_model=rerank_model,
+    )
+    if checkpoint_path and checkpoint_path.exists():
+        checkpoint = load_evaluation_checkpoint(checkpoint_path, metadata)
+        runs = checkpoint["runs"]
+        latencies = checkpoint["latencies"]
+        LOG.info("resuming evaluation with %d completed queries", len(runs["bm25"]))
     sem = asyncio.Semaphore(concurrency)
 
     def to_url_run(results) -> dict[str, float]:
@@ -263,6 +408,8 @@ async def run_all_modes(
         return run
 
     async def score_one(qid: str, qtext: str) -> None:
+        if qid in runs["bm25"]:
+            return
         async with sem:
             # Both get the raw query; VectorRetriever applies the qwen3
             # `Instruct: ...\nQuery: ...` wrapper internally.
@@ -271,7 +418,9 @@ async def run_all_modes(
             bm25_elapsed = time.perf_counter() - started
 
             started = time.perf_counter()
-            vector_results = await vector.retrieve(query=qtext, top_k=top_k)
+            vector_results = await with_provider_backoff(
+                lambda: vector.retrieve(query=qtext, top_k=top_k)
+            )
             vector_elapsed = time.perf_counter() - started
 
             # RRF only uses rank order, so feed the raw retriever lists (both
@@ -286,10 +435,12 @@ async def run_all_modes(
             # The configured top_k is the candidate-pool depth for the
             # cross-encoder as well as for the first-stage retrievers.
             started = time.perf_counter()
-            reranked = await reranker.rank(
-                query=qtext,
-                candidates=fused[:top_k],
-                top_k=top_k,
+            reranked = await with_provider_backoff(
+                lambda: reranker.rank(
+                    query=qtext,
+                    candidates=fused[:top_k],
+                    top_k=top_k,
+                )
             )
             reranker_elapsed = time.perf_counter() - started
 
@@ -306,6 +457,15 @@ async def run_all_modes(
             bm25_elapsed + vector_elapsed + fusion_elapsed + reranker_elapsed
         )
         latencies["reranker_stage"].append(reranker_elapsed)
+        if checkpoint_path:
+            save_evaluation_checkpoint(
+                checkpoint_path,
+                metadata=metadata,
+                runs=runs,
+                latencies=latencies,
+            )
+        if request_delay:
+            await asyncio.sleep(request_delay)
 
     await asyncio.gather(*(score_one(qid, qtext) for qid, qtext in queries))
     return runs, latencies
@@ -348,7 +508,7 @@ def print_comparison(
     args: argparse.Namespace,
     results: dict[str, tuple[dict[str, float], int]],
     latencies: dict[str, list[float]],
-    embedding_model: FireworksModelProvider,
+    embedding_model: BaseModelProvider,
     rerank_model: BaseModelProvider,
 ) -> None:
     order = ["bm25", "vector", "rrf", "reranked"]
@@ -441,20 +601,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
         LOG.info("running BM25 + vector + RRF + reranker over %s", args.dataset)
         settings = get_settings()
-        embedding_model = FireworksModelProvider(
-            api_key=settings.fireworks_api_key
-        )
-        if args.reranker_provider == "openrouter":
-            rerank_model: BaseModelProvider = OpenRouterModelProvider(
-                api_key=settings.openrouter_api_key,
-                embed_model=settings.openrouter_embed_model,
-                rerank_model=(
-                    args.openrouter_rerank_model
-                    or settings.openrouter_rerank_model
-                ),
-            )
-        else:
-            rerank_model = embedding_model
+        embedding_model, rerank_model = create_models(args, settings)
         try:
             runs, latencies = await run_all_modes(
                 engine,
@@ -467,6 +614,8 @@ async def async_main(args: argparse.Namespace) -> None:
                 args.top_k,
                 args.rrf_k,
                 args.concurrency,
+                Path(args.checkpoint) if args.checkpoint else None,
+                args.request_delay,
             )
         finally:
             if rerank_model is not embedding_model:
@@ -549,10 +698,24 @@ def parse_args() -> argparse.Namespace:
         help="queries to run in parallel (each does 1 embedding API call)",
     )
     parser.add_argument(
+        "--embedding-provider",
+        choices=("fireworks", "openrouter"),
+        default="fireworks",
+        help="provider used for query embeddings",
+    )
+    parser.add_argument(
         "--reranker-provider",
         choices=("fireworks", "openrouter"),
         default="fireworks",
         help="provider used only for the cross-encoder rerank stage",
+    )
+    parser.add_argument(
+        "--openrouter-embed-model",
+        default=None,
+        help=(
+            "OpenRouter embedding model override "
+            "(default: OPENROUTER_EMBED_MODEL)"
+        ),
     )
     parser.add_argument(
         "--openrouter-rerank-model",
@@ -562,7 +725,21 @@ def parse_args() -> argparse.Namespace:
             "(default: OPENROUTER_RERANK_MODEL or cohere/rerank-v3.5)"
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="JSON checkpoint path for resumable per-query evaluation",
+    )
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=0.0,
+        help="seconds to wait after each completed query",
+    )
+    args = parser.parse_args()
+    if args.checkpoint and args.concurrency != 1:
+        parser.error("--checkpoint requires --concurrency 1")
+    return args
 
 
 if __name__ == "__main__":
