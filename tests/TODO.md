@@ -8,7 +8,6 @@
 
 ## End-to-end coverage
 
-- Seed a disposable database and exercise retrieval, fusion, and reranking through `QueryEngine`.
 - Crawl and index a small local site, then verify that its pages become searchable.
 
 ## Search quality
