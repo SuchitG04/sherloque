@@ -75,7 +75,7 @@ class BM25Retriever(BaseRetriever):
                 {"tokens": tokens, "k1": k1, "b": b, "top_k": top_k},
             )
             rows = [record for record in cur]
-        results = [RetrieverResult(doc_id=row.doc_id, doc_title=row.doc_title, score=row.score) for row in rows]
+        results = [RetrieverResult(doc_id=row.doc_id, doc_title=row.doc_title or "", score=row.score) for row in rows]
         return results
 
 

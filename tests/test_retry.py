@@ -19,7 +19,7 @@ def http_error(status_code: int) -> httpx.HTTPStatusError:
 class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_retries_transient_http_errors(self) -> None:
         operation = AsyncMock(
-            side_effect=[http_error(429), http_error(503), "success"]
+            side_effect=[http_error(429), http_error(520), "success"]
         )
         wrapped = with_retry(max_retries=3, delay=0)(operation)
 
