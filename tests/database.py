@@ -36,7 +36,9 @@ class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
                     """
                     CREATE TABLE document (
                         _id SERIAL PRIMARY KEY,
-                        title TEXT NOT NULL,
+                        -- Production documents may have only a URL or body;
+                        -- keep the fixture's nullability aligned with init_db.
+                        title TEXT,
                         full_text TEXT NOT NULL,
                         len INTEGER NOT NULL,
                         embedding VECTOR(768)

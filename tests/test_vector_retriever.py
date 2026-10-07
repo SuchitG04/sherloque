@@ -77,3 +77,22 @@ class VectorRetrieverIntegrationTests(DatabaseTestCase):
         )
         self.assertAlmostEqual(results[0].score, 1.0)
         self.assertGreater(results[0].score, results[1].score)
+
+    async def test_returns_empty_title_for_an_untitled_document(self) -> None:
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO document (title, full_text, len, embedding)
+                    VALUES (NULL, 'Untitled', 1, :embedding)
+                    """
+                ),
+                {"embedding": self.query_vector},
+            )
+        model = MagicMock()
+        model.embed = AsyncMock(return_value=[self.query_vector])
+        retriever = VectorRetriever(self.engine, VectorRetrieverConfig(), model)
+
+        results = await retriever.retrieve(query="anything", top_k=4)
+
+        self.assertIn("", [result.doc_title for result in results])

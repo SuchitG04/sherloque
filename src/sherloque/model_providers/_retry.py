@@ -4,7 +4,10 @@ from random import random
 
 import httpx
 
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+def _is_retryable_status(status_code: int) -> bool:
+    """Return whether an HTTP response represents transient provider failure."""
+    return status_code == 429 or 500 <= status_code < 600
 
 
 def with_retry(
@@ -29,7 +32,7 @@ def with_retry(
                 except (httpx.TransportError, httpx.HTTPStatusError) as e:
                     if (
                         isinstance(e, httpx.HTTPStatusError)
-                        and e.response.status_code not in RETRYABLE_STATUS
+                        and not _is_retryable_status(e.response.status_code)
                     ):
                         raise
                     if attempt == max_retries - 1:

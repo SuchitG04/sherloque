@@ -75,3 +75,41 @@ class BM25RetrieverTests(DatabaseTestCase):
         self.assertEqual(len(results), 2)
         self.assertGreaterEqual(results[0].score, results[1].score)
         self.assertEqual(await self.retriever.retrieve(query="astronomy"), [])
+
+    async def test_returns_empty_title_for_an_untitled_document(self) -> None:
+        async with self.engine.begin() as connection:
+            document_id = (
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO document (title, full_text, len)
+                        VALUES (NULL, 'Untitled astronomy note', 3)
+                        RETURNING _id
+                        """
+                    )
+                )
+            ).scalar_one()
+            token_id = (
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO token (token, doc_freq)
+                        VALUES ('astronomy', 1)
+                        RETURNING _id
+                        """
+                    )
+                )
+            ).scalar_one()
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO term_doc_stats (doc_id, token_id, tf)
+                    VALUES (:doc_id, :token_id, 1)
+                    """
+                ),
+                {"doc_id": document_id, "token_id": token_id},
+            )
+
+        results = await self.retriever.retrieve(query="astronomy")
+
+        self.assertEqual(results[0].doc_title, "")
